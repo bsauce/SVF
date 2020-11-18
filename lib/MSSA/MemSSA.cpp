@@ -32,10 +32,20 @@
 #include "MSSA/MemSSA.h"
 #include "Graphs/SVFGStat.h"
 
+#include <string>
+#include <llvm/IR/DebugLoc.h>
+#include <llvm/Analysis/DominanceFrontier.h>
+#include <llvm/IR/InstIterator.h>	// for inst iteration
+#include <llvm/IR/CFG.h>		// for CFG
+#include <llvm/Analysis/CFG.h>	// for CFG
+#include <llvm/IR/GetElementPtrTypeIterator.h>
+
 using namespace SVF;
 using namespace SVFUtil;
 
 
+static llvm::cl::opt<bool> DumpRace("dump-race", llvm::cl::init(false),
+		llvm::cl::desc(""));
 static llvm::cl::opt<bool> DumpMSSA("dump-mssa", llvm::cl::init(false),
                                     llvm::cl::desc("Dump memory SSA"));
 static llvm::cl::opt<string> MSSAFun("mssafun",  llvm::cl::init(""),
@@ -602,6 +612,148 @@ u32_t MemSSA::getBBPhiNum() const
     return num;
 }
 
+static bool printParentType(llvm::Value *val, llvm::raw_ostream& Out) {
+	// TODO: print the val's parent type and the offset
+	//       TY:OFST
+	if (CastInst *ci = SVFUtil::dyn_cast<CastInst>(val)) {
+		return printParentType(ci->getOperand(0), Out);
+	} else if (GetElementPtrInst *ge = SVFUtil::dyn_cast<GetElementPtrInst>(val)) {
+		// TODO: sometimes extracting the type is possible even if some indices are variables
+		bool flag = false;
+		Type *ty = NULL;
+		if (SVFUtil::isa<StructType>(ge->getSourceElementType())) {
+			flag = true;
+			ty = ge->getSourceElementType();
+		}
+		Value *op = NULL;
+		//Out << *ge << "\n\n";
+		for (llvm::generic_gep_type_iterator<GetElementPtrInst::op_iterator> gtit =
+				llvm::generic_gep_type_iterator<GetElementPtrInst::op_iterator>::begin(ge->getSourceElementType(), ge->idx_begin()),
+				gteit = llvm::generic_gep_type_iterator<GetElementPtrInst::op_iterator>::end(ge->idx_end());
+				gtit != gteit;
+				gtit++) {
+			//Out << *gtit.getIndexedType() << ' ' << *(gtit.getOperand()) << '\n';
+			if (flag && SVFUtil::isa<ConstantInt>(gtit.getOperand())) {
+				op = SVFUtil::cast<ConstantInt>(gtit.getOperand());
+			}
+			flag = false;
+			if (SVFUtil::isa<StructType>(gtit.getIndexedType())) {
+				ty = gtit.getIndexedType();
+				flag = true;
+			}
+		}
+		/*
+		   if (ty) {
+		   StructType* st = cast<StructType>(ty);
+		   if (st->hasName()) {
+		   Out << st->getName() << '\n';
+		   }
+		   }
+		   if (op) {
+		   Out << *op << '\n';
+		   }
+		   */
+		if (ty && op) {
+			StructType* st = SVFUtil::cast<StructType>(ty);
+			if (st->hasName()) {
+				Out << st->getName() << ":" << *op;
+				return true;
+			}
+			return false;
+		} else if (!ty) {
+			// TODO: Is this right? GEP but no struct indexing, assuming array indexing
+			return printParentType(ge->getPointerOperand(), Out);
+		}
+	}
+	return false;
+}
+
+static inline void _printType(llvm::Type *ty, llvm::Value* val, llvm::raw_ostream& Out) {
+	// TODO: if ty is general type, and it is came from cast, print the source type of cast_
+
+	if (auto *ci = SVFUtil::dyn_cast<BitCastInst>(val)) {
+		Out << *(ci->getSrcTy());
+	} else if (ConstantExpr* ce = SVFUtil::dyn_cast<ConstantExpr>(val)) {
+		if (ce->getOpcode() == Instruction::BitCast)
+			Out << *(ce->getOperand(0)->getType());
+	} else {
+		Out << *(ty);
+	}
+}
+
+string memfunction[] = {"memcpy", "memmove", "strcpy"};
+
+#define LENGTH(arr) (sizeof(arr) / sizeof(*arr))
+static inline bool isMemAccessFunction(llvm::Function* func) {
+	std::string funcName = func->getName();
+	for (int i=0; i< LENGTH(memfunction); i++) {
+		if (funcName.find(memfunction[i]) != std::string::npos)
+			return true;
+	}
+	return false;
+}
+
+static bool isStackAccess(llvm::Value *val) {
+
+	if (AllocaInst *ai = SVFUtil::dyn_cast<AllocaInst>(val)) {
+		return true;
+	} else if (StoreInst *si = SVFUtil::dyn_cast<StoreInst>(val)) {
+		return isStackAccess(si->getPointerOperand());
+	} else if (LoadInst *li = SVFUtil::dyn_cast<LoadInst>(val)) {
+		return isStackAccess(li->getPointerOperand());
+	} else if (CastInst *ci = SVFUtil::dyn_cast<CastInst>(val)) {
+		return isStackAccess(ci->getOperand(0));
+	}
+
+	return false;
+}
+
+static inline void printType(llvm::Instruction &inst, llvm::raw_ostream& Out) {
+	//       What I'm interested in is
+	//       1. load
+	//       2. store
+	//       3. Extcall
+	//       3-1. memcpy
+	//       3-2. memmove
+	//       3-3. ?
+	//       4. ?
+	Out << "({";
+	if (LoadInst *li = SVFUtil::dyn_cast<LoadInst>(&inst)) {
+		auto *op = li->getPointerOperand();
+		//if (isInStruct(op)/* && isIntType(op->getType())*/) {
+		if(printParentType(op, Out)) {
+			Out << "->";
+		} else {
+			//}
+			_printType(li->getType(), li, Out);
+	}
+	} else if(StoreInst *si = SVFUtil::dyn_cast<StoreInst>(&inst)) {
+		auto* op = si->getValueOperand();
+		auto* val = si->getPointerOperand();
+		//if (isInStruct(val)/* && isIntType(val->getType())*/) {
+		// There are too many int type and they generate fake race candidates
+		// Print the parent struct type if possible
+		if(printParentType(val, Out)) {
+			Out << "->";
+		} else {
+			//}
+			_printType(op->getType(), op, Out);
+	}
+	} else if (isCallSite(&inst) && isExtCall(&inst) == true) {
+		CallInst* ci = SVFUtil::dyn_cast<CallInst>(&inst);
+
+		if (isMemAccessFunction(ci->getCalledFunction())) {
+			auto *op = ci->getArgOperand(0);
+			_printType(op->getType(), op, Out);
+		}
+	}
+
+	// I don't exit the program in the case that I don't expect
+	// In that case, result file will contain ({}) and I can string search it to identify what I missed.
+	Out << "})";
+}
+
+
 /*!
  * Print SSA
  */
@@ -621,7 +773,7 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
 
         Out << "==========FUNCTION: " << fun->getName() << "==========\n";
         // dump function entry chi nodes
-        if (hasFuncEntryChi(fun))
+        if (hasFuncEntryChi(fun) && !DumpRace)
         {
             CHISet & entry_chis = getFuncEntryChiSet(fun);
             for (CHISet::iterator chi_it = entry_chis.begin(); chi_it != entry_chis.end(); chi_it++)
@@ -634,10 +786,10 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
                 bit != ebit; ++bit)
         {
             BasicBlock& bb = *bit;
-            if (bb.hasName())
+            if (bb.hasName() && !DumpRace) // I don't need the bb name
                 Out << bb.getName() << "\n";
             PHISet& phiSet = getPHISet(&bb);
-            for(PHISet::iterator pi = phiSet.begin(), epi = phiSet.end(); pi !=epi; ++pi)
+            for(PHISet::iterator pi = phiSet.begin(), epi = phiSet.end(); !DumpRace && pi !=epi; ++pi) // Also I don't have any interest on PHI
             {
                 (*pi)->dump();
             }
@@ -647,7 +799,7 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
                     it != eit; ++it)
             {
                 Instruction& inst = *it;
-                bool isAppCall = isNonInstricCallSite(&inst) && !isExtCall(&inst);
+                bool isAppCall = isNonInstricCallSite(&inst) && !isExtCall(&inst) && !DumpRace;
                 if (isAppCall || isHeapAllocExtCall(&inst))
                 {
                     const CallBlockNode* cs = pag->getICFG()->getCallBlockNode(&inst);
@@ -682,9 +834,13 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
                 else
                 {
                     bool dump_preamble = false;
+                    bool has_chi_or_mu = false;
+                    bool has_debug_loc = (inst.getDebugLoc() || !DumpRace);
                     PAGEdgeList& pagEdgeList = mrGen->getPAGEdgesFromInst(&inst);
+                    if (isStackAccess(&inst))
+				continue;
                     for(PAGEdgeList::const_iterator bit = pagEdgeList.begin(), ebit= pagEdgeList.end();
-                            bit!=ebit; ++bit)
+                            bit!=ebit && has_debug_loc; ++bit)
                     {
                         const PAGEdge* edge = *bit;
                         if (const LoadPE* load = SVFUtil::dyn_cast<LoadPE>(edge))
@@ -697,16 +853,19 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
                                     Out << "\n";
                                     dump_preamble = true;
                                 }
+                                has_chi_or_mu = true;
                                 (*it)->dump();
                             }
                         }
                     }
 
-                    Out << inst << "\n";
+                    if (!DumpRace) {
+                            Out << inst << "\n";
+                    }
 
                     bool has_chi = false;
                     for(PAGEdgeList::const_iterator bit = pagEdgeList.begin(), ebit= pagEdgeList.end();
-                            bit!=ebit; ++bit)
+                            bit!=ebit && has_debug_loc; ++bit)
                     {
                         const PAGEdge* edge = *bit;
                         if (const StorePE* store = SVFUtil::dyn_cast<StorePE>(edge))
@@ -715,10 +874,23 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
                             for(CHISet::iterator it = chiSet.begin(), eit = chiSet.end(); it!=eit; ++it)
                             {
                                 has_chi = true;
+                                has_chi_or_mu = true;
                                 (*it)->dump();
                             }
                         }
                     }
+                    if (DumpRace && has_chi_or_mu) {
+                        // Print out the debug location
+                        if (const llvm::DebugLoc &Loc = (inst.getDebugLoc())) { // Here I is an LLVM instruction
+                            Out << "\t[[";
+                            Loc.print(Out);
+                            Out << "]]";
+                            // Print out the type
+                            printType(inst, Out);
+                            Out << '\n';
+                        }
+                    }
+
                     if (has_chi)
                     {
                         Out << "\n";
@@ -731,7 +903,7 @@ void MemSSA::dumpMSSA(raw_ostream& Out)
         }
 
         // dump return mu nodes
-        if (hasReturnMu(fun))
+        if (hasReturnMu(fun) && !DumpRace)
         {
             MUSet & return_mus = getReturnMuSet(fun);
             for (MUSet::iterator mu_it = return_mus.begin(); mu_it != return_mus.end(); mu_it++)
